@@ -1,0 +1,33 @@
+service: plontis-central-api
+
+provider:
+  name: aws
+  runtime: python3.9
+  stage: prod
+  region: us-east-1
+  environment:
+    DB_HOST: plontis-central.cu7ee8mue0y6.us-east-1.rds.amazonaws.com
+    DB_USER: plontis
+    DB_PASSWORD: Andyandy19
+    DB_NAME: plontis_central
+
+functions:
+  api:
+    handler: handler.api_handler
+    timeout: 30
+    events:
+      - http:
+          path: /
+          method: ANY
+          cors: true
+      - http:
+          path: /{proxy+}
+          method: ANY
+          cors: true
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: non-linux

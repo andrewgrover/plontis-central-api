@@ -1,0 +1,8 @@
+{
+  "Variables": {
+    "DB_HOST": "plontis-central.cu7ee8mue0y6.us-east-1.rds.amazonaws.com",
+    "DB_USER": "plontis",
+    "DB_PASSWORD": "Andyandy19",
+    "DB_NAME": "plontis_central"
+  }
+}

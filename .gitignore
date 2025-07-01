@@ -1,0 +1,12 @@
+debug_handler.py
+env-vars.json
+.env
+node_modules/
+.serverless/
+__pycache/
+handler.py.tmp
+package.json
+packger-lock.json
+test_conn.py
+*.zip
+.DS_Store
