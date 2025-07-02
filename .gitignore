@@ -6,7 +6,8 @@ node_modules/
 __pycache/
 handler.py.tmp
 package.json
-packger-lock.json
+package-lock.json
 test_conn.py
 *.zip
 .DS_Store
+fix-database.sh

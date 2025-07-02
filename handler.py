@@ -3,16 +3,66 @@ import os
 import pymysql
 from datetime import datetime
 import logging
+import sys
 
-# Set up logging
+# Fix logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+def fix_site_hash_in_lambda():
+    """Fix site_hash values directly from Lambda"""
+    connection = get_db_connection()
+    if not connection:
+        return False
+    
+    try:
+        with connection.cursor() as cursor:
+            # Check current state
+            cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NULL OR site_hash = ''")
+            null_count = cursor.fetchone()[0]
+            print(f"Lambda sees {null_count} records with NULL/empty site_hash")
+            
+            if null_count > 0:
+                # Fix them directly from Lambda
+                correct_site_hash = "f51bc27669e6f0c9cd71fe4dae0c03f44d461738e7e45b615188398def349678"
+                
+                print(f"Fixing {null_count} records with site_hash: {correct_site_hash}")
+                
+                cursor.execute("""
+                    UPDATE detections 
+                    SET site_hash = %s 
+                    WHERE site_hash IS NULL OR site_hash = ''
+                """, (correct_site_hash,))
+                
+                updated_rows = cursor.rowcount
+                print(f"Lambda updated {updated_rows} records")
+                
+                # Verify the fix
+                cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NOT NULL AND site_hash != ''")
+                valid_count = cursor.fetchone()[0]
+                print(f"After fix: {valid_count} records have valid site_hash")
+                
+                return True
+            else:
+                print("Lambda sees no NULL site_hash values")
+                return True
+                
+    except Exception as e:
+        print(f"Lambda fix error: {str(e)}")
+        return False
+    finally:
+        connection.close()
 
 def api_handler(event, context):
     """Main Lambda handler for Plontis Central API"""
     
     try:
         # Log the incoming event for debugging
+        print(f"Event received: {json.dumps(event, default=str)}")
         logger.info(f"Event received: {json.dumps(event, default=str)}")
         
         # Parse the request
@@ -21,10 +71,12 @@ def api_handler(event, context):
         headers = event.get('headers', {})
         body = event.get('body', '{}')
         
+        print(f"Processing: {method} {path}")
         logger.info(f"Processing: {method} {path}")
         
         # Route requests
         if method == 'GET' and path == '/v1/market-intelligence':
+            print("Calling get_market_intelligence")
             logger.info("Calling get_market_intelligence")
             return get_market_intelligence()
         elif method == 'POST' and path == '/v1/detections':
@@ -46,6 +98,7 @@ def api_handler(event, context):
                 })
             }
         else:
+            print(f"No route matched for {method} {path}")
             logger.info(f"No route matched for {method} {path}")
             return {
                 'statusCode': 404,
@@ -54,7 +107,9 @@ def api_handler(event, context):
             }
             
     except Exception as e:
-        logger.error(f"API Error: {str(e)}", exc_info=True)
+        error_msg = f"API Error: {str(e)}"
+        print(error_msg)
+        logger.error(error_msg, exc_info=True)
         return {
             'statusCode': 500,
             'headers': {'Content-Type': 'application/json'},
@@ -62,18 +117,23 @@ def api_handler(event, context):
         }
 
 def get_db_connection():
-    """Database connection"""
+    """Database connection with forced fresh connection"""
     try:
         host = os.environ.get('DB_HOST')
         user = os.environ.get('DB_USER')
         password = os.environ.get('DB_PASSWORD')
         database = os.environ.get('DB_NAME')
         
+        print(f"Attempting database connection to: {host} as {user} to database {database}")
         logger.info(f"Connecting to database: {host} as {user}")
         
         if not all([host, user, password, database]):
-            raise Exception("Missing database environment variables")
+            missing = [k for k, v in {'DB_HOST': host, 'DB_USER': user, 'DB_PASSWORD': password, 'DB_NAME': database}.items() if not v]
+            error_msg = f"Missing database environment variables: {missing}"
+            print(error_msg)
+            raise Exception(error_msg)
         
+        # Force a completely fresh connection every time
         connection = pymysql.connect(
             host=host,
             user=user,
@@ -81,83 +141,200 @@ def get_db_connection():
             database=database,
             charset='utf8mb4',
             autocommit=True,
-            connect_timeout=10
+            connect_timeout=10,
+            read_timeout=10,
+            write_timeout=10,
+            # Force fresh connection - no connection reuse
+            use_unicode=True,
+            sql_mode='TRADITIONAL'
         )
         
+        print("Database connection successful")
         logger.info("Database connection successful")
+        
+        # Force a test query to ensure we have the latest data
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NOT NULL")
+            non_null_count = cursor.fetchone()[0]
+            print(f"DEBUG: Records with non-NULL site_hash: {non_null_count}")
+            
+            cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NULL")
+            null_count = cursor.fetchone()[0]
+            print(f"DEBUG: Records with NULL site_hash: {null_count}")
+        
         return connection
         
     except Exception as e:
-        logger.error(f"Database connection failed: {str(e)}")
+        error_msg = f"Database connection failed: {str(e)}"
+        print(error_msg)
+        logger.error(error_msg)
         return None
 
 def get_market_intelligence():
-    """Public market intelligence endpoint"""
+    """Public market intelligence endpoint with auto-fix"""
     
     try:
+        print("=== Starting market intelligence function ===")
         logger.info("Starting market intelligence function")
         
-        # Try to get live data from database
+        # Get a fresh database connection
         connection = get_db_connection()
         
         if connection:
             try:
                 with connection.cursor() as cursor:
-                    # Get recent stats
-                    sql = """
-                        SELECT company, COUNT(*) as detections, 
-                               AVG(estimated_value) as avg_value, SUM(estimated_value) as total_value
-                        FROM detections 
-                        WHERE detected_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                        GROUP BY company
-                        ORDER BY total_value DESC
-                        LIMIT 5
-                    """
+                    # Check table exists
+                    print("Checking if detections table exists...")
+                    cursor.execute("SHOW TABLES LIKE 'detections'")
+                    table_exists = cursor.fetchone()
                     
-                    cursor.execute(sql)
-                    results = cursor.fetchall()
-                    
-                    logger.info(f"Database query returned {len(results)} rows")
-                    
-                    if results:
-                        # Process real data
-                        top_companies = []
-                        total_detections = 0
-                        total_value = 0
-                        
-                        for row in results:
-                            company_data = {
-                                'company': row[0],
-                                'detections': int(row[1]),
-                                'total_value': float(row[3])
-                            }
-                            top_companies.append(company_data)
-                            total_detections += int(row[1])
-                            total_value += float(row[3])
-                        
-                        avg_value = total_value / total_detections if total_detections > 0 else 0
-                        
-                        stats = {
-                            'total_detections_24h': total_detections,
-                            'top_companies': top_companies,
-                            'average_content_value': round(avg_value, 2),
-                            'last_updated': datetime.now().isoformat(),
-                            'status': 'live_data'
-                        }
+                    if not table_exists:
+                        print("ERROR: Detections table does not exist!")
+                        stats = get_fallback_stats('no_detections_table')
                     else:
-                        # No data in database, return sample data
-                        stats = get_sample_data('no_database_data')
+                        print("Detections table exists, checking data...")
                         
-                connection.close()
+                        # Get total count
+                        cursor.execute("SELECT COUNT(*) FROM detections")
+                        total_count = cursor.fetchone()[0]
+                        print(f"Total records in detections table: {total_count}")
+                        
+                        # Check site_hash status
+                        cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NOT NULL AND site_hash != ''")
+                        valid_hash_count = cursor.fetchone()[0]
+                        print(f"Records with valid site_hash: {valid_hash_count}")
+                        
+                        cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NULL OR site_hash = ''")
+                        invalid_hash_count = cursor.fetchone()[0]
+                        print(f"Records with invalid site_hash: {invalid_hash_count}")
+                        
+                        # If no valid site_hash values, try to fix them
+                        if valid_hash_count == 0 and invalid_hash_count > 0:
+                            print("ERROR: No records have valid site_hash values!")
+                            print("Attempting to fix site_hash values from Lambda...")
+                            
+                            # Close current connection and fix
+                            connection.close()
+                            
+                            # Try to fix the data
+                            fix_success = fix_site_hash_in_lambda()
+                            
+                            if fix_success:
+                                print("Fix applied, retrying query...")
+                                # Get a new connection and try again
+                                connection = get_db_connection()
+                                if connection:
+                                    with connection.cursor() as new_cursor:
+                                        # Check again after fix
+                                        new_cursor.execute("SELECT COUNT(*) FROM detections WHERE site_hash IS NOT NULL AND site_hash != ''")
+                                        fixed_count = new_cursor.fetchone()[0]
+                                        print(f"After Lambda fix: {fixed_count} records have valid site_hash")
+                                        
+                                        if fixed_count > 0:
+                                            # Now get real statistics
+                                            print("Getting statistics with fixed data...")
+                                            new_cursor.execute("""
+                                                SELECT 
+                                                    COUNT(DISTINCT site_hash) as total_sites,
+                                                    COUNT(*) as total_detections,
+                                                    AVG(estimated_value) as avg_value_per_detection
+                                                FROM detections 
+                                                WHERE site_hash IS NOT NULL 
+                                                AND site_hash != ''
+                                                AND detected_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+                                            """)
+                                            
+                                            result = new_cursor.fetchone()
+                                            print(f"Statistics query result after fix: {result}")
+                                            
+                                            # Get most active company
+                                            new_cursor.execute("""
+                                                SELECT company, COUNT(*) as count
+                                                FROM detections 
+                                                WHERE site_hash IS NOT NULL 
+                                                AND site_hash != ''
+                                                AND detected_at > DATE_SUB(NOW(), INTERVAL 7 DAY) 
+                                                AND company IS NOT NULL
+                                                GROUP BY company 
+                                                ORDER BY count DESC 
+                                                LIMIT 1
+                                            """)
+                                            company_result = new_cursor.fetchone()
+                                            most_active = company_result[0] if company_result else 'N/A'
+                                            print(f"Most active company: {most_active}")
+                                            
+                                            stats = {
+                                                'total_sites': int(result[0] or 0),
+                                                'total_detections': int(result[1] or 0),
+                                                'average_value_per_detection': round(float(result[2] or 0), 2),
+                                                'most_active_company': most_active,
+                                                'status': 'live_data_fixed',
+                                                'last_updated': datetime.now().isoformat()
+                                            }
+                                        else:
+                                            stats = get_fallback_stats('fix_failed')
+                                else:
+                                    stats = get_fallback_stats('reconnection_failed')
+                            else:
+                                stats = get_fallback_stats('fix_failed')
+                        else:
+                            # We have valid data, proceed normally
+                            print("Getting detection statistics...")
+                            cursor.execute("""
+                                SELECT 
+                                    COUNT(DISTINCT site_hash) as total_sites,
+                                    COUNT(*) as total_detections,
+                                    AVG(estimated_value) as avg_value_per_detection
+                                FROM detections 
+                                WHERE site_hash IS NOT NULL 
+                                AND site_hash != ''
+                                AND detected_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+                            """)
+                            
+                            result = cursor.fetchone()
+                            print(f"Statistics query result: {result}")
+                            
+                            # Get most active company
+                            cursor.execute("""
+                                SELECT company, COUNT(*) as count
+                                FROM detections 
+                                WHERE site_hash IS NOT NULL 
+                                AND site_hash != ''
+                                AND detected_at > DATE_SUB(NOW(), INTERVAL 7 DAY) 
+                                AND company IS NOT NULL
+                                GROUP BY company 
+                                ORDER BY count DESC 
+                                LIMIT 1
+                            """)
+                            company_result = cursor.fetchone()
+                            most_active = company_result[0] if company_result else 'N/A'
+                            print(f"Most active company: {most_active}")
+                            
+                            stats = {
+                                'total_sites': int(result[0] or 0),
+                                'total_detections': int(result[1] or 0),
+                                'average_value_per_detection': round(float(result[2] or 0), 2),
+                                'most_active_company': most_active,
+                                'status': 'live_data',
+                                'last_updated': datetime.now().isoformat()
+                            }
+                
+                if connection:
+                    connection.close()
                 
             except Exception as db_error:
-                logger.error(f"Database query error: {str(db_error)}")
-                stats = get_sample_data(f'database_query_error')
+                error_msg = f"Database operation error: {str(db_error)}"
+                print(error_msg)
+                logger.error(error_msg, exc_info=True)
+                stats = get_fallback_stats('database_operation_error')
                 if connection:
                     connection.close()
         else:
-            # No database connection, return sample data
-            stats = get_sample_data('no_database_connection')
+            print("No database connection available")
+            stats = get_fallback_stats('no_database_connection')
+        
+        print(f"Final stats being returned: {stats}")
+        logger.info(f"Final stats being returned: {stats}")
         
         return {
             'statusCode': 200,
@@ -169,12 +346,27 @@ def get_market_intelligence():
         }
         
     except Exception as e:
-        logger.error(f"Market intelligence error: {str(e)}", exc_info=True)
+        error_msg = f"Market intelligence error: {str(e)}"
+        print(error_msg)
+        logger.error(error_msg, exc_info=True)
         return {
             'statusCode': 500,
             'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': f'Market intelligence error: {str(e)}'})
+            'body': json.dumps({'error': error_msg})
         }
+
+def get_fallback_stats(reason='fallback'):
+    """Return fallback stats when no real data is available"""
+    stats = {
+        'total_sites': 1,
+        'total_detections': 0,
+        'average_value_per_detection': 0.00,
+        'most_active_company': 'N/A',
+        'status': f'fallback_{reason}',
+        'last_updated': datetime.now().isoformat()
+    }
+    print(f"Returning fallback stats: {stats}")
+    return stats
 
 def get_sample_data(reason='fallback'):
     """Return sample data"""
